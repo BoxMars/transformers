@@ -16,6 +16,8 @@
 
 from typing import Optional, Union
 
+import gc
+
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -66,7 +68,7 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx:int = 0):
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
@@ -77,6 +79,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList(
             [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
         )
+
+        self.layer_idx = layer_idx
+
+        self.expert_stat = []
+
+        self.config = config
+
+        self.expert_device = [None] * self.num_experts
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -91,6 +101,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
+        self.expert_stat+=selected_experts.to('cpu').tolist()
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -118,6 +129,35 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
+    def get_expert_stat(self):
+        return self.expert_stat
+
+    def reset_expert_stat(self):
+        self.expert_stat = []
+
+    def export_all_experts(self, path:str):
+        for expert_idx, expert in enumerate(self.experts):
+            expert_state_dict = expert.state_dict()
+            torch.save(expert_state_dict, f"{path}/expert_{self.layer_idx}_{expert_idx}.pt")
+    
+    def import_expert(self, path, expert_idx):
+        assert expert_idx < self.num_experts, f"expert_idx {expert_idx} is out of range for num_experts {self.num_experts}, layer_idx: {self.layer_idx}"
+        assert self.experts[expert_idx] is None, "Expert already loaded in memory!,  layer_idx: {self.layer_idx}"
+
+        expert_state_dict = torch.load(f"{path}/expert_{self.layer_idx}_{expert_idx}.pt")
+        self.experts[expert_idx] = Qwen3MoeMLP(self.config, intermediate_size=self.config.moe_intermediate_size)
+        self.experts[expert_idx].load_state_dict(expert_state_dict).to(self.expert_device[expert_idx])
+    
+    def offload_expert_from_memory(self, expert_idx):
+        print(f"Remove {expert_idx} from memory, layer_idx: {self.layer_idx}")
+        self.expert_device[expert_idx] = next(self.experts[expert_idx].parameters()).device
+        model = self.experts[expert_idx]
+        self.experts[expert_idx] = nn.Identity().to("cpu")
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 
 class Qwen3MoeRMSNorm(LlamaRMSNorm):
     pass
@@ -133,12 +173,14 @@ class Qwen3MoeDecoderLayer(Qwen2MoeDecoderLayer, nn.Module):
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeSparseMoeBlock(config)
+            self.mlp = Qwen3MoeSparseMoeBlock(config, layer_idx=layer_idx)
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
 
         self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.layer_idx = layer_idx
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -178,9 +220,58 @@ class Qwen3MoeDecoderLayer(Qwen2MoeDecoderLayer, nn.Module):
 
         return hidden_states
 
+    def get_expert_stat(self):
+        if hasattr(self.mlp, "get_expert_stat"):
+            return self.mlp.get_expert_stat()
+        return None
+
+    def reset_expert_stat(self):
+        if hasattr(self.mlp, "reset_expert_stat"):
+            self.mlp.reset_expert_stat()
+    
+    def export_all_experts(self, path:str):
+        if hasattr(self.mlp, "export_all_experts"):
+            self.mlp.export_all_experts(path)
+        
+    def import_expert(self, path, expert_idx):
+        if hasattr(self.mlp, "import_expert"):
+            self.mlp.import_expert(path, expert_idx)
+
+    def offload_expert(self, expert_idx):
+        if hasattr(self.mlp, "offload_expert_from_memory"):
+            self.mlp.offload_expert_from_memory(expert_idx)
 
 class Qwen3MoeModel(MixtralModel):
     pass
+    def get_expert_stat(self):
+        expert_stat = {}
+        for layer in self.layers:
+            if hasattr(layer, "get_expert_stat"):
+                expert_stat[layer.layer_idx] = layer.get_expert_stat()
+        return expert_stat
+    def reset_expert_stat(self):
+        for layer in self.layers:
+            if hasattr(layer, "reset_expert_stat"):
+                layer.reset_expert_stat()
+
+    def export_all_experts(self, path:str):
+        for layer in self.layers:
+            if hasattr(layer, "export_all_experts"):
+                layer.export_all_experts(path)
+    
+    def import_expert(self, path, layer_idx, expert_idx):
+        for layer in self.layers:
+            if layer.layer_idx == layer_idx and hasattr(layer, "import_expert"):
+                layer.import_expert(path, expert_idx)
+                return
+        raise ValueError(f"Layer with layer_idx {layer_idx} not found")
+
+    def offload_expert(self, layer_idx, expert_idx):
+        for layer in self.layers:
+            if layer.layer_idx == layer_idx and hasattr(layer, "offload_expert"):
+                layer.offload_expert(expert_idx)
+                return
+        raise ValueError(f"Layer with layer_idx {layer_idx} not found")
 
 
 class Qwen3MoeForCausalLM(MixtralForCausalLM):
@@ -272,7 +363,23 @@ class Qwen3MoeForCausalLM(MixtralForCausalLM):
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
+    def get_expert_stat(self):
+        expert_stat = self.model.get_expert_stat()
+        if expert_stat is not None:
+            return expert_stat
+        return None
 
+    def reset_expert_stat(self):
+        self.model.reset_expert_stat()
+
+    def export_all_experts(self, path:str):
+        self.model.export_all_experts(path)
+    
+    def import_expert(self, path, layer_idx, expert_idx):
+        self.model.import_expert(path, layer_idx, expert_idx)
+
+    def offload_expert(self, layer_idx, expert_idx):
+        self.model.offload_expert(layer_idx, expert_idx)
 
 class Qwen3MoeForSequenceClassification(LlamaForSequenceClassification):
     pass
@@ -290,7 +397,7 @@ __all__ = [
     "Qwen3MoeForCausalLM",
     "Qwen3MoeForQuestionAnswering",
     "Qwen3MoeModel",
-    "Qwen3MoePreTrainedModel",  # noqa: F822
+    # "Qwen3MoePreTrainedModel",  # noqa: F822
     "Qwen3MoeForSequenceClassification",
     "Qwen3MoeForTokenClassification",
 ]
