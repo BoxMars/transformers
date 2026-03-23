@@ -596,6 +596,27 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 return
         raise ValueError(f"Layer with layer_idx {layer_idx} not found")
 
+    def get_memory_info(self):
+        total_memory = 0
+        for param in self.parameters():
+            total_memory += param.nelement() * param.element_size()
+        for buffer in self.buffers():
+            total_memory += buffer.nelement() * buffer.element_size()
+
+        # expert memory
+        expert_memory = 0
+        for layer in self.layers:
+            for param in layer.parameters():
+                expert_memory += param.nelement() * param.element_size()
+
+            for buffer in layer.buffers():
+                expert_memory += buffer.nelement() * buffer.element_size()
+
+        print(f"Model memory: {total_memory / 1024**2:.2f} MB")
+        print(f"Expert memory: {expert_memory / 1024**2:.2f} MB")
+        print(f"Other memory: {(total_memory - expert_memory) / 1024**2:.2f} MB")
+        print(f"Expert memory ratio: {expert_memory / total_memory:.2%}")
+
 
 def load_balancing_loss_func(
     gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
@@ -806,6 +827,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
 
     def offload_expert(self, layer_idx, expert_idx):
         self.model.offload_expert(layer_idx, expert_idx)
+
+    def get_memory_info(self):
+        self.model.get_memory_info()
 
 
 class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3MoePreTrainedModel):
